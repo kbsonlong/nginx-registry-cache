@@ -1,0 +1,21 @@
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      # Keep host ports configurable; hosts often already use 443/8080.
+      - "${PROXY_PORT:-28080}:8080"
+      - "${CACHE_PORT:-25443}:443"
+      - "${METRICS_PORT:-29145}:9145"
+    environment:
+      PROXY_BASIC: "proxy-user:proxy-token"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - aliyun-blob-cache:/data/registry-aliyun-blobs
+
+volumes:
+  aliyun-blob-cache:
