@@ -1,6 +1,7 @@
 # OpenResty Registry Cache
 
-这个配置验证两条独立链路，并保留认证与 metrics：
+这个配置验证两条独立链路，并保留认证与 metrics。正向代理凭据从只读挂载的
+`htpasswd` 文件加载；每个文件条目都是一个独立用户：
 
 ```text
 普通 HTTPS 请求
@@ -39,7 +40,7 @@ PROXY_PORT=28080 CACHE_PORT=25443 METRICS_PORT=29145 ./test.sh
 
 1. 构建产物为 OpenResty `1.27.1.2`，并包含 proxy-connect 模块；运行配置通过 `nginx -t`。
 2. 未带 Proxy Token 的 HTTP 请求仍可到达上游，兼容生产存量未认证客户端。
-3. 带 `proxy-user:proxy-token` 的 CONNECT 可到达 Aliyun Registry upstream；显式错误凭据仍返回 407。
+3. `htpasswd` 中的 `proxy-user:proxy-token` 与 `proxy-reader:reader-token` 都可通过 CONNECT；显式错误凭据仍返回 407。
 4. HTTPS Registry cache 仅通过容器内 443 暴露，旧 Registry 监听不再发布。
 5. metrics 通过容器内 9145 暴露，认证失败计数可查询。
 6. 可选执行冷拉取，验证 OSS blob 首次 MISS、再次 HIT。
@@ -53,7 +54,25 @@ PROXY_PORT=28080 CACHE_PORT=25443 METRICS_PORT=29145 ./test.sh
 ```bash
 curl -v -x http://127.0.0.1:28080 https://registry-1.docker.io/v2/
 curl -v -x http://proxy-user:proxy-token@127.0.0.1:28080 https://registry-1.docker.io/v2/
+curl -v -x http://proxy-reader:reader-token@127.0.0.1:28080 https://registry-1.docker.io/v2/
 ```
+
+## 正向代理用户文件
+
+Compose 将本目录的 `htpasswd.example` 只读挂载到
+`/etc/openresty/auth/htpasswd`。它是两个演示用户的 fixture；生产环境请以同一路径
+挂载由 Secret 管理的文件，不要把实际凭据复制进镜像或提交到仓库。服务每 5 秒重新
+读取该文件，因此以原子替换文件的方式更新用户无需重建镜像。
+
+推荐用 bcrypt 创建用户：
+
+```bash
+htpasswd -Bbn proxy-user 'replace-with-a-token' > htpasswd
+htpasswd -Bbn proxy-reader 'replace-with-another-token' >> htpasswd
+```
+
+认证代码支持 bcrypt、SHA-crypt、Apache MD5、传统 crypt、`{SHA}`、`{SSHA}` 和
+`{PLAIN}`/明文格式；明文只为兼容 `htpasswd -p`，生产环境不得使用。
 
 HTTPS Registry cache：
 

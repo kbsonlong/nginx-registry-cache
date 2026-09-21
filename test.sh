@@ -10,6 +10,7 @@ PROXY_PORT="${PROXY_PORT:-28080}"
 CACHE_PORT="${CACHE_PORT:-25443}"
 METRICS_PORT="${METRICS_PORT:-29145}"
 PROXY="http://proxy-user:proxy-token@127.0.0.1:${PROXY_PORT}"
+READER_PROXY="http://proxy-reader:reader-token@127.0.0.1:${PROXY_PORT}"
 CACHE="https://127.0.0.1:${CACHE_PORT}"
 UPSTREAM="https://registry.cn-hangzhou.aliyuncs.com/v2/"
 REGISTRY_HOSTS=(
@@ -70,6 +71,11 @@ echo "== authenticated CONNECT reaches Registry upstream =="
 status="$(curl -ksS -o /dev/null -w '%{http_code}' \
     -x "$PROXY" "$UPSTREAM")"
 test "$status" = 401
+
+echo "== a second htpasswd user is also accepted =="
+reader_status="$(curl -ksS -o /dev/null -w '%{http_code}' \
+    -x "$READER_PROXY" "$UPSTREAM")"
+test "$reader_status" = 401
 
 echo "== metrics remains reachable =="
 metrics_status="$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:${METRICS_PORT}/metrics")"

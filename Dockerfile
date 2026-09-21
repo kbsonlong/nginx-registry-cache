@@ -36,7 +36,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libpcre3 libssl3 openssl zlib1g \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /etc/openresty/certs /etc/openresty/logs /data/registry-aliyun-blobs /data/registry-temp \
+    && mkdir -p /etc/openresty/auth /etc/openresty/certs /etc/openresty/logs /data/registry-aliyun-blobs /data/registry-temp \
     && openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
        -subj '/CN=registry-cache.local' \
        -addext 'subjectAltName=DNS:registry-cache.local,DNS:localhost,IP:127.0.0.1' \
@@ -46,6 +46,7 @@ RUN apt-get update \
 
 COPY --from=build /usr/local/openresty /usr/local/openresty
 COPY nginx.conf /etc/openresty/nginx.conf
+COPY lua /etc/openresty/lua
 
 EXPOSE 8080 443 9145
 
