@@ -1,0 +1,9 @@
+.DS_Store
+registry-cache.crt
+
+# Runtime cache/log artifacts
+poc/aliyun-blob-cache/
+poc/registry-temp/
+*.log
+secrets.example
+*.pyc

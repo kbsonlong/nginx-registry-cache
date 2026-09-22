@@ -7,6 +7,9 @@ local CACHE_TTL_SECONDS = 5
 
 local metrics = assert(ngx.shared.proxy_metrics, "proxy_metrics shared dict is required")
 local auth_cache = assert(ngx.shared.proxy_auth, "proxy_auth shared dict is required")
+local crypto = require "crypto"
+local secrets = require "secrets"
+local snapshot = require "snapshot"
 
 local function increment(key)
     metrics:incr(key, 1, 0)
@@ -94,16 +97,56 @@ local function password_matches(password, password_hash)
         return constant_time_equal(password, password_hash:sub(8))
     end
 
-    -- ngx.crypt delegates bcrypt, SHA-crypt, Apache MD5 and legacy crypt
-    -- formats to the image's libcrypt implementation.
-    if password_hash:sub(1, 1) == "$" or password_hash:sub(1, 1) == "_" then
-        local derived = ngx.crypt(password, password_hash)
-        return derived and constant_time_equal(derived, password_hash) or false
+    -- The file adapter intentionally supports the portable htpasswd formats
+    -- above only. Production traffic uses the control-plane HMAC-SHA-256
+    -- snapshot path; never place a literal password in this compatibility file.
+    return false
+end
+
+local function snapshot_user_id(username, token)
+    -- Never allow an unexpected request-header representation to turn an
+    -- authentication failure into a worker error / HTTP 500.
+    if type(username) ~= "string" or type(token) ~= "string" then
+        return false, "invalid"
+    end
+    local current = snapshot.current()
+    if not current then
+        -- The local htpasswd backend remains a POC compatibility fallback
+        -- until every client has been migrated to the control plane.
+        return nil
     end
 
-    -- `htpasswd -p` stores a literal password. It is accepted for local
-    -- compatibility only; production files must use a one-way hash.
-    return constant_time_equal(password, password_hash)
+    local user = current.users_by_name[username]
+    if not user then
+        return nil
+    end
+
+    if user.status ~= "active" then
+        return false, "disabled"
+    end
+    local now = os.date("!%Y-%m-%dT%H:%M:%SZ")
+    if user.expires_at and user.expires_at <= now then
+        return false, "expired"
+    end
+
+    local pepper, pepper_err = secrets.auth_pepper()
+    if not pepper then
+        ngx.log(ngx.ERR, "authentication pepper unavailable: ", pepper_err)
+        return false, "unavailable"
+    end
+    local digest = crypto.hmac_sha256_hex(pepper, token)
+    local expired = false
+    for _, credential in ipairs(user.credentials) do
+        if not credential.revoked_at then
+            if (credential.not_before and credential.not_before > now)
+                or (credential.expires_at and credential.expires_at <= now) then
+                expired = true
+            elseif crypto.constant_time_equal(digest, credential.token_digest) then
+                return user.id
+            end
+        end
+    end
+    return false, expired and "expired" or "invalid"
 end
 
 local header = ngx.req.get_headers()["proxy-authorization"]
@@ -123,9 +166,24 @@ if not encoded then
 end
 
 local decoded = ngx.decode_base64(encoded)
-local username, password = decoded and decoded:match("^([^:]+):(.*)$")
-if not username then
+local separator = decoded and decoded:find(":", 1, true)
+if not separator or separator == 1 then
     return reject("invalid")
+end
+local username = decoded:sub(1, separator - 1)
+local password = decoded:sub(separator + 1)
+
+local managed_user_id, managed_result = snapshot_user_id(username, password)
+if managed_user_id then
+    ngx.var.proxy_user_id = managed_user_id
+    increment("requests_total|" .. managed_user_id)
+    return
+end
+if managed_result then
+    if managed_result == "unavailable" then
+        return unavailable()
+    end
+    return reject(managed_result)
 end
 
 local users = load_users()
@@ -133,7 +191,8 @@ if not users then
     return unavailable()
 end
 
-if not password_matches(password, users[username]) then
+local password_hash = users[username]
+if not password_hash or not password_matches(password, password_hash) then
     return reject("invalid")
 end
 

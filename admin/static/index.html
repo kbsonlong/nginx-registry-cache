@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Proxy Admin</title>
+  <style>
+    :root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+    body { max-width: 1050px; margin: 2rem auto; padding: 0 1rem; }
+    header, form, .toolbar { display: flex; gap: .75rem; align-items: end; flex-wrap: wrap; }
+    label { display: grid; gap: .3rem; font-size: .85rem; } input { padding: .5rem; min-width: 13rem; }
+    button { padding: .48rem .75rem; cursor: pointer; } table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    th, td { border-bottom: 1px solid #8886; padding: .65rem; text-align: left; } code { word-break: break-all; }
+    #notice { min-height: 1.5rem; margin: 1rem 0; } .error { color: #d33; } .token { background: #d6f5d6; color: #111; padding: 1rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>Proxy Admin</h1><small>管理 API 仅适用于本地或管理网络。</small></div>
+    <label>管理 Token<input id="token" type="password" autocomplete="off" placeholder="Bearer token"></label>
+    <label>操作者<input id="actor" value="web-admin"></label>
+    <button id="refresh">刷新</button>
+  </header>
+  <p id="notice" role="status"></p>
+  <section>
+    <h2>创建用户</h2>
+    <form id="create-user"><label>用户名<input name="username" required maxlength="128"></label>
+      <label>策略<input name="policy_id" value="default"></label><button>创建</button></form>
+  </section>
+  <section><h2>用户</h2><table><thead><tr><th>用户名</th><th>状态</th><th>策略</th><th>到期</th><th>操作</th></tr></thead><tbody id="users"></tbody></table></section>
+  <section><h2>审计事件</h2><pre id="audit">点击刷新加载</pre></section>
+  <script>
+    const notice = document.querySelector('#notice'), users = document.querySelector('#users'), audit = document.querySelector('#audit');
+    function headers() { return {'Authorization': `Bearer ${document.querySelector('#token').value}`, 'X-Actor': document.querySelector('#actor').value || 'web-admin', 'X-Request-ID': crypto.randomUUID(), 'Content-Type': 'application/json'}; }
+    async function api(path, options = {}) { const response = await fetch(path, {...options, headers: {...headers(), ...(options.headers || {})}}); const body = response.status === 204 ? null : await response.json(); if (!response.ok) throw new Error(body.detail || '请求失败'); return body; }
+    function message(text, error = false) { notice.textContent = text; notice.className = error ? 'error' : ''; }
+    async function refresh() { try { const [data, events] = await Promise.all([api('/v1/users'), api('/v1/audit-events?limit=10')]); users.innerHTML = data.items.map(user => `<tr><td>${user.username}</td><td>${user.status}</td><td>${user.policy_id}</td><td>${user.expires_at || '-'}</td><td><button data-token="${user.id}">新 Token</button> <button data-status="${user.id}">${user.status === 'active' ? '禁用' : '启用'}</button></td></tr>`).join(''); audit.textContent = events.items.map(event => `${event.occurred_at} ${event.actor} ${event.action} ${event.resource_id}`).join('\n') || '暂无事件'; message('已刷新'); } catch (error) { message(error.message, true); } }
+    document.querySelector('#refresh').onclick = refresh;
+    document.querySelector('#create-user').onsubmit = async event => { event.preventDefault(); const form = new FormData(event.target); try { await api('/v1/users', {method:'POST', body:JSON.stringify(Object.fromEntries(form))}); event.target.reset(); await refresh(); } catch (error) { message(error.message, true); } };
+    users.onclick = async event => { const id = event.target.dataset.token || event.target.dataset.status; if (!id) return; try { if (event.target.dataset.token) { const result = await api(`/v1/users/${id}/tokens`, {method:'POST', body:'{}'}); message(`只显示一次：${result.token}`); notice.className='token'; } else { const action = event.target.textContent === '禁用' ? 'disable' : 'enable'; await api(`/v1/users/${id}/${action}`, {method:'POST', body:'{}'}); await refresh(); } } catch (error) { message(error.message, true); } };
+  </script>
+</body>
+</html>

@@ -15,6 +15,7 @@ Registry pull
 ```
 
 metrics 默认通过 `127.0.0.1:29145` 暴露；正向代理默认通过 `127.0.0.1:28080` 暴露。
+管理 API 仅绑定在 `127.0.0.1:28081`，不会复用任何代理监听端口。
 
 ## 前置条件
 
@@ -42,7 +43,8 @@ PROXY_PORT=28080 CACHE_PORT=25443 METRICS_PORT=29145 ./test.sh
 2. 未带 Proxy Token 的 HTTP 请求仍可到达上游，兼容生产存量未认证客户端。
 3. `htpasswd` 中的 `proxy-user:proxy-token` 与 `proxy-reader:reader-token` 都可通过 CONNECT；显式错误凭据仍返回 407。
 4. HTTPS Registry cache 仅通过容器内 443 暴露，旧 Registry 监听不再发布。
-5. metrics 通过容器内 9145 暴露，认证失败计数可查询。
+5. 管理面能创建用户与一次性 Token、禁用/启用用户、撤销 Token，并把签名快照发布给 OpenResty；每个变更均产生审计事件。
+6. metrics 通过容器内 9145 暴露，认证失败计数可查询。
 6. 可选执行冷拉取，验证 OSS blob 首次 MISS、再次 HIT。
 
 测试不依赖 Docker Hub 或公网 DNS。默认 `./test.sh` 会重建镜像；排查运行中容器时可用 `BUILD=0 ./test.sh` 跳过重建。
@@ -64,15 +66,50 @@ Compose 将本目录的 `htpasswd.example` 只读挂载到
 挂载由 Secret 管理的文件，不要把实际凭据复制进镜像或提交到仓库。服务每 5 秒重新
 读取该文件，因此以原子替换文件的方式更新用户无需重建镜像。
 
-推荐用 bcrypt 创建用户：
+兼容文件仅用于迁移期，使用 Apache SHA 创建：
 
 ```bash
-htpasswd -Bbn proxy-user 'replace-with-a-token' > htpasswd
-htpasswd -Bbn proxy-reader 'replace-with-another-token' >> htpasswd
+htpasswd -sbn proxy-user 'replace-with-a-token' > htpasswd
+htpasswd -sbn proxy-reader 'replace-with-another-token' >> htpasswd
 ```
 
-认证代码支持 bcrypt、SHA-crypt、Apache MD5、传统 crypt、`{SHA}`、`{SSHA}` 和
-`{PLAIN}`/明文格式；明文只为兼容 `htpasswd -p`，生产环境不得使用。
+认证代码支持 `{SHA}` 和 `{SSHA}` 格式；该兼容适配器不接受明文、bcrypt 或 crypt 格式。
+生产环境应使用下文控制面生成的 HMAC-SHA-256 Token 快照，而不是继续依赖该文件。
+
+## 管理控制面
+
+`proxy-admin` 是一个独立的 FastAPI/SQLite POC 服务，实现设计文档第 8.4 节的用户、
+Token、禁用/启用和审计接口，并在 `http://127.0.0.1:28081/` 提供静态 HTML 管理页。它用 `HMAC-SHA-256(pepper, token)` 保存凭据摘要；Token
+仅在 `POST /v1/users/{id}/tokens` 的响应中返回一次。每次用户或 Token 变更都会推进
+快照版本，并发布 `{payload, signature}`；OpenResty 每 5 秒在内部 Docker 网络拉取、验证
+HMAC-SHA-256 签名后才接受新版快照。
+
+本地 POC 的四个 `secrets.example/*` 文件是可复现测试 fixture，启动前必须替换为 Secret
+管理系统提供的只读文件。生产环境不得提交它们、不得通过环境变量传递真实值，并且管理
+API 应置于独立管理网络，而不是仅依赖 compose 的 loopback 端口绑定。
+
+示例：
+
+```bash
+admin_token="$(tr -d '\r\n' < secrets.example/admin-api-token)"
+admin_url=http://127.0.0.1:28081
+headers=(-H "Authorization: Bearer $admin_token" -H 'X-Actor: operator' -H 'X-Request-ID: change-123')
+
+user_id="$(curl -fsS "${headers[@]}" -H 'Content-Type: application/json' \
+  -d '{"username":"build-runner"}' "$admin_url/v1/users" | jq -r .id)"
+token="$(curl -fsS "${headers[@]}" -H 'Content-Type: application/json' -d '{}' \
+  "$admin_url/v1/users/$user_id/tokens" | jq -r .token)"
+curl -v -x "http://build-runner:$token@127.0.0.1:28080" https://registry-1.docker.io/v2/
+
+# 轮换后确认客户端已切换，再撤销旧 Token；禁用可立即在下一个快照周期生效。
+curl -fsS "${headers[@]}" -X POST -H 'Content-Type: application/json' -d '{}' \
+  "$admin_url/v1/users/$user_id/disable"
+curl -fsS "${headers[@]}" "$admin_url/v1/audit-events?limit=20" | jq
+```
+
+在迁移期间，未被控制面快照声明的用户名仍会回退到挂载的 `htpasswd` 文件。只要同名用户
+进入快照，快照中的禁用、过期和撤销状态优先，不能由 `htpasswd` 绕过。生产切到
+`required` 模式前必须移除这一兼容后备，并完成设计文档第 8.8 节的三态和豁免实现。
 
 HTTPS Registry cache：
 

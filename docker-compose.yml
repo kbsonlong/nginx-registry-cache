@@ -15,6 +15,32 @@ services:
     volumes:
       - aliyun-blob-cache:/data/registry-aliyun-blobs
       - ./htpasswd.example:/etc/openresty/auth/htpasswd:ro
+      - ./secrets.example/auth-pepper:/etc/openresty/secrets/auth-pepper:ro
+      - ./secrets.example/snapshot-access-token:/etc/openresty/secrets/snapshot-access-token:ro
+      - ./secrets.example/snapshot-signing-key:/etc/openresty/secrets/snapshot-signing-key:ro
+    depends_on:
+      proxy-admin:
+        condition: service_started
+
+  proxy-admin:
+    build:
+      context: ./admin
+      dockerfile: Dockerfile
+    ports:
+      # The management API is a local POC endpoint, never a public proxy port.
+      - "127.0.0.1:${ADMIN_PORT:-28081}:8081"
+    environment:
+      AUTH_PEPPER_FILE: /run/secrets/auth-pepper
+      SNAPSHOT_SIGNING_KEY_FILE: /run/secrets/snapshot-signing-key
+      SNAPSHOT_ACCESS_TOKEN_FILE: /run/secrets/snapshot-access-token
+      ADMIN_API_TOKEN_FILE: /run/secrets/admin-api-token
+    volumes:
+      - proxy-admin-data:/var/lib/proxy-admin
+      - ./secrets.example/auth-pepper:/run/secrets/auth-pepper:ro
+      - ./secrets.example/snapshot-signing-key:/run/secrets/snapshot-signing-key:ro
+      - ./secrets.example/snapshot-access-token:/run/secrets/snapshot-access-token:ro
+      - ./secrets.example/admin-api-token:/run/secrets/admin-api-token:ro
 
 volumes:
   aliyun-blob-cache:
+  proxy-admin-data:

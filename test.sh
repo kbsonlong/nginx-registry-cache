@@ -9,9 +9,12 @@ BUILD="${BUILD:-1}"
 PROXY_PORT="${PROXY_PORT:-28080}"
 CACHE_PORT="${CACHE_PORT:-25443}"
 METRICS_PORT="${METRICS_PORT:-29145}"
+ADMIN_PORT="${ADMIN_PORT:-28081}"
 PROXY="http://proxy-user:proxy-token@127.0.0.1:${PROXY_PORT}"
 READER_PROXY="http://proxy-reader:reader-token@127.0.0.1:${PROXY_PORT}"
 CACHE="https://127.0.0.1:${CACHE_PORT}"
+ADMIN_URL="http://127.0.0.1:${ADMIN_PORT}"
+ADMIN_TOKEN="$(tr -d '\r\n' < secrets.example/admin-api-token)"
 UPSTREAM="https://registry.cn-hangzhou.aliyuncs.com/v2/"
 REGISTRY_HOSTS=(
     registry.ap-southeast-1.aliyuncs.com
@@ -38,12 +41,66 @@ grep -Fq -- '--add-module=/src/proxy-connect' <<<"$nginx_version"
 "${COMPOSE[@]}" exec -T proxy /usr/local/openresty/nginx/sbin/nginx \
     -t -p /etc/openresty -c /etc/openresty/nginx.conf
 
-echo "== 8080 proxy, 443 cache, and 9145 metrics are published =="
+echo "== proxy, cache, metrics, and loopback-only management API are published =="
 ports="$(${COMPOSE[@]} ps --format '{{.Ports}}')"
 grep -Fq -- '->8080/tcp' <<<"$ports"
 grep -Fq -- '->443/tcp' <<<"$ports"
 grep -Fq -- '->9145/tcp' <<<"$ports"
+grep -Fq -- '127.0.0.1:' <<<"$ports"
+grep -Fq -- '->8081/tcp' <<<"$ports"
 ! grep -Eq -- '->(5001|5003|5443)/tcp' <<<"$ports"
+
+echo "== control-plane lifecycle publishes signed snapshots =="
+for attempt in {1..15}; do
+    if curl -fsS "$ADMIN_URL/healthz" | jq -e '.status == "ok"' >/dev/null; then
+        break
+    fi
+    test "$attempt" -lt 15
+    sleep 1
+done
+
+admin_headers=(
+    -H "Authorization: Bearer $ADMIN_TOKEN"
+    -H "X-Actor: poc-test"
+    -H "X-Request-ID: control-plane-test"
+)
+users="$(curl -fsS "${admin_headers[@]}" "$ADMIN_URL/v1/users")"
+control_user_id="$(jq -r '.items[] | select(.username == "control-plane-test") | .id' <<<"$users")"
+if [[ -z "$control_user_id" ]]; then
+    control_user_id="$(curl -fsS "${admin_headers[@]}" -H 'Content-Type: application/json' \
+        -d '{"username":"control-plane-test"}' "$ADMIN_URL/v1/users" | jq -r '.id')"
+fi
+control_token="$(curl -fsS "${admin_headers[@]}" -H 'Content-Type: application/json' -d '{}' \
+    "$ADMIN_URL/v1/users/$control_user_id/tokens" | jq -r '.token')"
+control_proxy="http://control-plane-test:${control_token}@127.0.0.1:${PROXY_PORT}"
+
+expect_proxy_status() {
+    local expected="$1"
+    local actual=""
+    for attempt in {1..15}; do
+        actual="$(curl -ksS -o /dev/null -w '%{http_code}' -x "$control_proxy" "$UPSTREAM" || true)"
+        if [[ "$actual" = "$expected" ]]; then
+            return
+        fi
+        sleep 1
+    done
+    echo "expected proxy status $expected, got $actual" >&2
+    return 1
+}
+
+expect_proxy_status 401
+curl -fsS "${admin_headers[@]}" -X POST -H 'Content-Type: application/json' -d '{}' \
+    "$ADMIN_URL/v1/users/$control_user_id/disable" | jq -e '.status == "disabled"' >/dev/null
+expect_proxy_status 407
+curl -fsS "${admin_headers[@]}" -X POST -H 'Content-Type: application/json' -d '{}' \
+    "$ADMIN_URL/v1/users/$control_user_id/enable" | jq -e '.status == "active"' >/dev/null
+expect_proxy_status 401
+control_token_id="$(curl -fsS "${admin_headers[@]}" "$ADMIN_URL/v1/users/$control_user_id" | jq -r '.tokens[-1].id')"
+curl -fsS "${admin_headers[@]}" -X DELETE "$ADMIN_URL/v1/users/$control_user_id/tokens/$control_token_id" \
+    -o /dev/null -w '%{http_code}' | grep -Fx 204
+expect_proxy_status 407
+curl -fsS "${admin_headers[@]}" "$ADMIN_URL/v1/audit-events?limit=10" \
+    | jq -e '.items[] | select(.request_id == "control-plane-test")' >/dev/null
 
 echo "== HTTPS Registry cache is reachable =="
 cache_status="$(curl -ksS -o /dev/null -w '%{http_code}' "$CACHE/v2/")"
